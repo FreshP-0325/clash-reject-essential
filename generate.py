@@ -1,0 +1,144 @@
+#!/usr/bin/env python3
+"""Build a small Clash ad-blocking rule provider from public blocklists."""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+import urllib.request
+from pathlib import Path
+
+
+SOURCES = {
+    "reject": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/reject-list.txt",
+    "easylist": "https://easylist-downloads.adblockplus.org/easylistchina+easylist.txt",
+    "adguard": "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
+    "peter": "https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=0&mimetype=plaintext",
+    "dan": "https://someonewhocares.org/hosts/zero/hosts",
+}
+
+DOMAIN_RE = re.compile(
+    r"(?i)^(?:\*\.)?[a-z0-9_](?:[a-z0-9_-]{0,62})"
+    r"(?:\.[a-z0-9_](?:[a-z0-9_-]{0,62}))+\.?$"
+)
+
+
+def normalize_domain(value: str) -> str | None:
+    value = value.strip().lower().rstrip(".")
+    if not DOMAIN_RE.fullmatch(value) or value.startswith("_"):
+        return None
+    return value.removeprefix("*.")
+
+
+def parse_domains(text: str) -> set[str]:
+    """Extract DNS-blockable domains; intentionally ignore URL/regex rules."""
+    result: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line[0] in "!#[" or line.startswith(("@@", "/")):
+            continue
+        if line.startswith(("0.0.0.0 ", "127.0.0.1 ")):
+            parts = line.split()
+            line = parts[1] if len(parts) > 1 else ""
+        elif line.startswith("||"):
+            line = line[2:].split("^", 1)[0].split("$", 1)[0]
+        elif any(char in line for char in "/^$*|=, "):
+            continue
+        domain = normalize_domain(line)
+        if domain:
+            result.add(domain)
+    return result
+
+
+def is_covered(domain: str, rules: set[str]) -> bool:
+    labels = domain.split(".")
+    return any(".".join(labels[index:]) in rules for index in range(len(labels) - 1))
+
+
+def load_overrides(path: Path) -> set[str]:
+    if not path.exists():
+        return set()
+    return {
+        domain
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+        if (domain := normalize_domain(line))
+    }
+
+
+def download(url: str) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": "clash-reject-essential/1"})
+    with urllib.request.urlopen(request, timeout=90) as response:
+        return response.read().decode("utf-8", errors="replace")
+
+
+def read_sources(cache: Path | None) -> dict[str, set[str]]:
+    parsed: dict[str, set[str]] = {}
+    for name, url in SOURCES.items():
+        file = cache / f"{name}.txt" if cache else None
+        text = file.read_text(encoding="utf-8", errors="replace") if file and file.exists() else download(url)
+        parsed[name] = parse_domains(text)
+    return parsed
+
+
+def select(sources: dict[str, set[str]], mode: str) -> set[str]:
+    candidates = sources["reject"]
+    if mode == "essential":
+        # Two deliberately small, conservatively maintained lists act as the
+        # importance filter. Loyalsoldier remains the authoritative candidate set.
+        return {
+            domain for domain in candidates
+            if is_covered(domain, sources["peter"]) or is_covered(domain, sources["dan"])
+        }
+    if mode == "balanced":
+        return {
+            domain for domain in candidates
+            if is_covered(domain, sources["easylist"]) and is_covered(domain, sources["adguard"])
+        }
+    return {
+        domain for domain in candidates
+        if sum(is_covered(domain, sources[name]) for name in ("easylist", "adguard", "peter", "dan")) >= 3
+    }
+
+
+def remove_redundant(domains: set[str]) -> set[str]:
+    """Drop a child only when an explicitly selected parent already covers it."""
+    result = set()
+    for domain in domains:
+        labels = domain.split(".")
+        if not any(".".join(labels[index:]) in domains for index in range(1, len(labels) - 1)):
+            result.add(domain)
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--mode", choices=("essential", "balanced", "strict"), default="essential")
+    parser.add_argument("--output", type=Path, default=Path("reject-essential.txt"))
+    parser.add_argument("--cache", type=Path, help="directory containing reject/easylist/adguard/peter/dan.txt")
+    parser.add_argument("--allowlist", type=Path, default=Path("allowlist.txt"))
+    parser.add_argument("--include", type=Path, default=Path("include.txt"))
+    args = parser.parse_args()
+
+    sources = read_sources(args.cache)
+    selected = select(sources, args.mode) | load_overrides(args.include)
+    allowed = load_overrides(args.allowlist)
+    selected = {domain for domain in selected if not is_covered(domain, allowed)}
+    selected = remove_redundant(selected)
+
+    lines = [
+        "# Generated by clash-reject-essential; do not edit this file directly.",
+        f"# mode: {args.mode}; rules: {len(selected)}",
+        "payload:",
+        *(f"  - '+.{domain}'" for domain in sorted(selected)),
+        "",
+    ]
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text("\n".join(lines), encoding="utf-8", newline="\n")
+    print(f"wrote {len(selected)} rules to {args.output}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
